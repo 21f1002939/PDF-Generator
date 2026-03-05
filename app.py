@@ -3,17 +3,26 @@ import pandas as pd
 import io
 import re
 import time
-import os
-from google_auth_oauthlib.flow import InstalledAppFlow
+import json
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
+# --- 1. CONFIGURATION & SCOPES ---
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/presentations',
     'https://www.googleapis.com/auth/drive'
 ]
 
+# Load secrets from Streamlit Vault
+if "google_secret" in st.secrets:
+    client_config = json.loads(st.secrets["google_secret"])
+else:
+    st.error("❌ Missing 'google_secret' in Streamlit Secrets! Please add it in Advanced Settings.")
+    st.stop()
+
+# --- 2. HELPER FUNCTIONS ---
 def extract_id(url, type='sheet'):
     if type == 'sheet':
         match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url)
@@ -30,187 +39,154 @@ def col_to_letter(n):
         string = chr(65 + remainder) + string
     return string
 
+# --- 3. CLOUD AUTHENTICATION ---
 st.title("📄 Professional PDF Generator")
-st.write("Now with Dynamic Filenames and True Auto-Resume.")
 
-# --- UI SECTION 1: THE INPUTS ---
-st.header("1. File Links")
-sheet_url = st.text_input("Google Sheet URL")
-slide_url = st.text_input("Google Slide Template URL")
-folder_url = st.text_input("Google Drive Output Folder URL")
+# CHANGE THIS to your actual Streamlit URL (e.g., https://ashish-pdf.streamlit.app)
+# This MUST match what you entered in Google Cloud Console exactly.
+redirect_uri = "https://auto-pdf-generator.streamlit.app/" 
 
-if st.button("Connect Google Account & Load Sheet"):
-    if not os.path.exists("client_secret.json"):
-        st.error("❌ client_secret.json not found!")
-    elif sheet_url and slide_url and folder_url:
-        with st.spinner("Connecting..."):
-            try:
-                flow = InstalledAppFlow.from_client_secrets_file('client_secret.json', SCOPES)
-                creds = flow.run_local_server(port=8080, prompt='consent') 
-                
-                st.session_state['sheets_service'] = build('sheets', 'v4', credentials=creds)
-                st.session_state['slides_service'] = build('slides', 'v1', credentials=creds)
-                st.session_state['drive_service'] = build('drive', 'v3', credentials=creds)
-                
-                st.session_state['sheet_id'] = extract_id(sheet_url, 'sheet')
-                st.session_state['slide_id'] = extract_id(slide_url, 'slides')
-                st.session_state['folder_id'] = extract_id(folder_url, 'folder')
-                
-                st.success("✅ Connected successfully! Proceed to Step 2.")
-            except Exception as e:
-                st.error(f"Error: {e}")
+flow = Flow.from_client_config(
+    client_config,
+    scopes=SCOPES,
+    redirect_uri=redirect_uri
+)
 
-# --- UI SECTION 2: THE CONFIGURATION ---
-if 'sheet_id' in st.session_state:
-    st.header("2. Smart Configuration")
-    
-    st.info("💡 **Naming Rule:** Type your desired PDF name below. Use `<<Column Name>>` to insert data from your sheet. You can combine multiple columns and manual text.")
-    
-    # NEW: Dynamic Flexible Filename Template
-    filename_template = st.text_input(
-        "PDF Filename Template:", 
-        value="<<School ID>> - <<School Name>> - Partnership Letter"
-    )
+if 'creds' not in st.session_state:
+    auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+    st.info("Please connect your Google account to begin.")
+    st.link_button("🔑 Connect Google Account", auth_url)
 
-    st.warning("⚠️ **Important:** Make sure your Google Sheet has exactly two columns named **Status** and **PDF Link** to track progress.")
-
-    if st.button("Start Generating / Resume Processing"):
-        
-        # 1. LIVE FETCH (Fixes the resume bug)
-        status_text = st.empty()
-        status_text.text("Fetching latest data from Google Sheets...")
-        
-        result = st.session_state['sheets_service'].spreadsheets().values().get(
-            spreadsheetId=st.session_state['sheet_id'], range='Sheet1'
-        ).execute()
-        values = result.get('values', [])
-        
-        if not values:
-            st.error("Your Google Sheet is empty!")
+    # Check if we are coming back from Google with a code
+    code = st.query_params.get("code")
+    if code:
+        try:
+            flow.fetch_token(code=code)
+            st.session_state['creds'] = flow.credentials
+            st.success("✅ Authentication Successful!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Authentication Error: {e}")
             st.stop()
+else:
+    # If already logged in, show the app
+    creds = st.session_state['creds']
+    sheets_service = build('sheets', 'v4', credentials=creds)
+    slides_service = build('slides', 'v1', credentials=creds)
+    drive_service = build('drive', 'v3', credentials=creds)
+
+    st.sidebar.success("Account Connected")
+    if st.sidebar.button("Logout / Reset"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+
+    # --- 4. THE MAIN INTERFACE ---
+    st.header("1. File Setup")
+    sheet_url = st.text_input("Google Sheet URL")
+    slide_url = st.text_input("Google Slide Template URL")
+    folder_url = st.text_input("Google Drive Output Folder URL")
+
+    if sheet_url and slide_url and folder_url:
+        sheet_id = extract_id(sheet_url, 'sheet')
+        slide_id = extract_id(slide_url, 'slides')
+        folder_id = extract_id(folder_url, 'folder')
+
+        st.header("2. PDF Configuration")
+        st.info("Use `<<Column Name>>` in the filename template.")
+        filename_template = st.text_input("PDF Filename Template:", value="<<School ID>> - Document")
+
+        if st.button("🚀 Start Generating / Resume"):
+            status_display = st.empty()
+            progress_bar = st.progress(0)
             
-        headers = values[0]
-        
-        if 'Status' not in headers or 'PDF Link' not in headers:
-            st.error("❌ Could not find 'Status' or 'PDF Link' columns. Please add them to your sheet header.")
-            st.stop()
-
-        # Fixes the "Invisible Cell" bug by forcing all rows to be the same length
-        max_cols = len(headers)
-        padded_rows = []
-        for r in values[1:]:
-            padded_rows.append(r + [''] * (max_cols - len(r)))
+            # Fetch latest data
+            result = sheets_service.spreadsheets().values().get(
+                spreadsheetId=sheet_id, range='Sheet1'
+            ).execute()
+            values = result.get('values', [])
             
-        df = pd.DataFrame(padded_rows, columns=headers)
+            if not values:
+                st.error("The Google Sheet is empty!")
+            else:
+                headers = values[0]
+                if 'Status' not in headers or 'PDF Link' not in headers:
+                    st.error("Missing 'Status' or 'PDF Link' columns in Header!")
+                    st.stop()
 
-        status_idx = headers.index('Status') + 1
-        link_idx = headers.index('PDF Link') + 1
-        status_letter = col_to_letter(status_idx)
-        link_letter = col_to_letter(link_idx)
+                # Padding rows for consistent lengths
+                max_cols = len(headers)
+                df_rows = [r + [''] * (max_cols - len(r)) for r in values[1:]]
+                df = pd.DataFrame(df_rows, columns=headers)
 
-        total_rows = len(df)
-        progress_bar = st.progress(0)
-        
-        # 2. THE GENERATION LOOP
-        for index, row in df.iterrows():
-            
-            # TRUE RESUME LOGIC
-            current_status = str(row.get('Status', '')).strip().lower()
-            if 'success' in current_status:
-                progress_bar.progress((index + 1) / total_rows)
-                continue
+                status_idx = headers.index('Status') + 1
+                link_idx = headers.index('PDF Link') + 1
+                status_col_letter = col_to_letter(status_idx)
+                link_col_letter = col_to_letter(link_idx)
 
-            try:
-                # DYNAMIC FILENAME CREATION
-                filename = filename_template
-                for h in headers:
-                    val = str(row.get(h, "")).strip()
-                    # Replace the tag with actual data
-                    filename = filename.replace(f"<<{h}>>", val)
-                
-                # Clean up the name and add .pdf
-                filename = filename.strip()
-                if not filename.lower().endswith(".pdf"):
-                    filename += ".pdf"
-                
-                status_text.text(f"Processing ({index+1}/{total_rows}): {filename}")
+                for index, row in df.iterrows():
+                    # Resume Logic
+                    if str(row.get('Status', '')).strip().lower() == 'success':
+                        progress_bar.progress((index + 1) / len(df))
+                        continue
 
-                # Copy Template
-                copy_body = {'name': filename.replace('.pdf', '')}
-                copied_file = st.session_state['drive_service'].files().copy(
-                    fileId=st.session_state['slide_id'], body=copy_body
-                ).execute()
-                temp_slide_id = copied_file['id']
+                    try:
+                        # Dynamic Filename
+                        fname = filename_template
+                        for h in headers:
+                            fname = fname.replace(f"<<{h}>>", str(row.get(h, "")))
+                        fname = fname.strip() + ".pdf" if not fname.lower().endswith(".pdf") else fname
 
-                # Replace Text in Slide
-                requests = []
-                for h in headers:
-                    val = str(row.get(h, "")).strip()
-                    requests.append({
-                        'replaceAllText': {
-                            'containsText': {'text': f"<<{h}>>", 'matchCase': False},
-                            'replaceText': val
-                        }
-                    })
-                
-                if requests:
-                    st.session_state['slides_service'].presentations().batchUpdate(
-                        presentationId=temp_slide_id, body={'requests': requests}
-                    ).execute()
+                        status_display.text(f"Processing: {fname}")
 
-                # Export to PDF
-                request = st.session_state['drive_service'].files().export_media(
-                    fileId=temp_slide_id, mimeType='application/pdf'
-                )
-                fh = io.BytesIO()
-                downloader = MediaIoBaseDownload(fh, request)
-                done = False
-                while not done:
-                    _, done = downloader.next_chunk()
+                        # 1. Copy Slide
+                        copy_body = {'name': fname.replace('.pdf', '')}
+                        temp_slide = drive_service.files().copy(fileId=slide_id, body=copy_body).execute()
+                        temp_id = temp_slide['id']
 
-                # Upload PDF to Drive Folder
-                fh.seek(0)
-                file_metadata = {'name': filename, 'parents': [st.session_state['folder_id']]}
-                media = MediaIoBaseUpload(fh, mimetype='application/pdf', resumable=True)
-                uploaded_pdf = st.session_state['drive_service'].files().create(
-                    body=file_metadata, media_body=media, fields='webViewLink'
-                ).execute()
-                pdf_link = uploaded_pdf.get('webViewLink')
+                        # 2. Replace Text
+                        reqs = []
+                        for h in headers:
+                            reqs.append({
+                                'replaceAllText': {
+                                    'containsText': {'text': f"<<{h}>>", 'matchCase': False},
+                                    'replaceText': str(row.get(h, ""))
+                                }
+                            })
+                        slides_service.presentations().batchUpdate(presentationId=temp_id, body={'requests': reqs}).execute()
 
-                # Delete Temp Slide
-                st.session_state['drive_service'].files().delete(fileId=temp_slide_id).execute()
+                        # 3. Export PDF
+                        export_req = drive_service.files().export_media(fileId=temp_id, mimeType='application/pdf')
+                        pdf_content = io.BytesIO()
+                        downloader = MediaIoBaseDownload(pdf_content, export_req)
+                        done = False
+                        while not done:
+                            _, done = downloader.next_chunk()
 
-                # UPDATE GOOGLE SHEET LIVE
-                sheet_row = index + 2
-                
-                st.session_state['sheets_service'].spreadsheets().values().update(
-                    spreadsheetId=st.session_state['sheet_id'],
-                    range=f"Sheet1!{status_letter}{sheet_row}",
-                    valueInputOption="USER_ENTERED",
-                    body={"values": [["Success"]]}
-                ).execute()
+                        # 4. Upload to Folder
+                        pdf_content.seek(0)
+                        meta = {'name': fname, 'parents': [folder_id]}
+                        media = MediaIoBaseUpload(pdf_content, mimetype='application/pdf', resumable=True)
+                        uploaded = drive_service.files().create(body=meta, media_body=media, fields='webViewLink').execute()
+                        link = uploaded.get('webViewLink')
 
-                st.session_state['sheets_service'].spreadsheets().values().update(
-                    spreadsheetId=st.session_state['sheet_id'],
-                    range=f"Sheet1!{link_letter}{sheet_row}",
-                    valueInputOption="USER_ENTERED",
-                    body={"values": [[pdf_link]]}
-                ).execute()
+                        # 5. Cleanup & Update Sheet
+                        drive_service.files().delete(fileId=temp_id).execute()
+                        
+                        row_num = index + 2
+                        sheets_service.spreadsheets().values().update(
+                            spreadsheetId=sheet_id, range=f"Sheet1!{status_col_letter}{row_num}",
+                            valueInputOption="USER_ENTERED", body={"values": [["Success"]]}
+                        ).execute()
+                        sheets_service.spreadsheets().values().update(
+                            spreadsheetId=sheet_id, range=f"Sheet1!{link_col_letter}{row_num}",
+                            valueInputOption="USER_ENTERED", body={"values": [[link]]}
+                        ).execute()
 
-                progress_bar.progress((index + 1) / total_rows)
-                time.sleep(1) 
+                    except Exception as e:
+                        st.error(f"Row {index+1} Error: {e}")
 
-            except Exception as e:
-                st.error(f"Error on row {index+1}: {e}")
-                try:
-                    st.session_state['sheets_service'].spreadsheets().values().update(
-                        spreadsheetId=st.session_state['sheet_id'],
-                        range=f"Sheet1!{status_letter}{index+2}",
-                        valueInputOption="USER_ENTERED",
-                        body={"values": [[f"Failed: {str(e)[:50]}"]]}
-                    ).execute()
-                except: pass
+                    progress_bar.progress((index + 1) / len(df))
 
-        status_text.text("Done!")
-        st.success("🎉 All pending rows processed!")
-        st.balloons()
+                status_display.text("All Finished!")
+                st.balloons()
