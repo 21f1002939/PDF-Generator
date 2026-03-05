@@ -44,7 +44,7 @@ st.title("📄 Professional PDF Generator")
 
 # CHANGE THIS to your actual Streamlit URL (e.g., https://ashish-pdf.streamlit.app)
 # This MUST match what you entered in Google Cloud Console exactly.
-redirect_uri = "https://auto-pdf-generator.streamlit.app" 
+redirect_uri = "https://auto-pdf-generator.streamlit.app/" 
 
 flow = Flow.from_client_config(
     client_config,
@@ -190,4 +190,5 @@ else:
 
                 status_display.text("All Finished!")
                 st.balloons()
+
 
